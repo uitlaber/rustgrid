@@ -31,13 +31,17 @@ pub(crate) fn load(root: &Path) -> ConfigResult<BTreeMap<String, String>> {
 
     let contents = fs::read_to_string(path)?;
     let file: SecretsFile = serde_json::from_str(&contents)?;
+    // A missing key cannot decrypt existing ciphertext. Do not silently generate a replacement
+    // key and later overwrite the user's stored credentials with an empty map.
+    if !root.join(KEY_FILE).exists() {
+        return Err(ConfigError::Crypto);
+    }
     let cipher = cipher_for(root)?;
 
     let mut secrets = BTreeMap::new();
     for (id, encoded) in file.secrets {
-        if let Some(password) = decrypt(&cipher, &encoded) {
-            secrets.insert(id, password);
-        }
+        let password = decrypt(&cipher, &encoded).ok_or(ConfigError::Crypto)?;
+        secrets.insert(id, password);
     }
 
     Ok(secrets)
@@ -57,7 +61,9 @@ pub(crate) fn save(root: &Path, secrets: &BTreeMap<String, String>) -> ConfigRes
         secrets: encoded,
     };
     let contents = serde_json::to_string_pretty(&file)?;
-    fs::write(root.join(SECRETS_FILE), contents)?;
+    let temporary = root.join(format!("{SECRETS_FILE}.tmp"));
+    fs::write(&temporary, contents)?;
+    fs::rename(temporary, root.join(SECRETS_FILE))?;
     Ok(())
 }
 

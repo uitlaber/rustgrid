@@ -1610,6 +1610,13 @@ impl AppView {
                             ),
                         theme,
                     ));
+                    body = body.child(form_field(
+                        t!("form.tunnel.key_passphrase").to_string(),
+                        false,
+                        None,
+                        div().w_full().child(inputs.password.clone()),
+                        theme,
+                    ));
                 } else {
                     body = body.child(form_field(
                         password_label.to_string(),
@@ -1738,9 +1745,15 @@ impl AppView {
     fn set_tunnel_auth(&mut self, auth: TunnelAuth, cx: &mut Context<'_, Self>) {
         if let Some(form) = self.form.as_mut()
             && let Some(layer) = form.settings.tunnel.first_mut()
+            && layer.auth != auth
         {
             layer.auth = auth;
+            // An SSH login password and a private-key passphrase are different secrets.
+            // Never send a key passphrase to the server after switching to password login.
+            layer.password.clear();
         }
+        self.rebuild_tunnel_inputs(cx);
+        self.test_status = TestStatus::Idle;
         self.form_tunnel_select_open = false;
         cx.notify();
     }
@@ -2195,7 +2208,11 @@ impl AppView {
                     (
                         String::new(),
                         String::new(),
-                        t!("form.tunnel.password_placeholder").to_string(),
+                        if layer.auth == TunnelAuth::KeyFile {
+                            t!("form.tunnel.key_passphrase_placeholder").to_string()
+                        } else {
+                            t!("form.tunnel.password_placeholder").to_string()
+                        },
                     )
                 } else {
                     (
@@ -2812,6 +2829,7 @@ fn make_tunnel_input(
             value,
             TextInputOptions {
                 placeholder: placeholder.into(),
+                masked: field == TunnelField::Password,
                 size: Some(gpui_kit::component::Size::Medium),
                 text_size: Some(13.0),
                 ..Default::default()

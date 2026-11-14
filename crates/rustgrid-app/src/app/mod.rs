@@ -3169,7 +3169,13 @@ impl AppView {
         runtime: Arc<Runtime>,
         cx: &mut Context<'_, Self>,
     ) -> Self {
-        let secrets = config.load_secrets().unwrap_or_default();
+        let (secrets, secrets_error) = match config.load_secrets() {
+            Ok(secrets) => (secrets, None),
+            Err(error) => (
+                BTreeMap::new(),
+                Some(t!("connection.secrets_load_failed", error = error.to_string()).to_string()),
+            ),
+        };
         let settings = load_startup_settings(&config);
         // 启动时恢复 owns every bit of restored tree state — the open connections/databases as well
         // as the expansion of connections, databases and groups. With it off, the tree starts
@@ -3618,7 +3624,7 @@ impl AppView {
                 })
             },
             delete_confirm: None,
-            error_dialog: None,
+            error_dialog: secrets_error,
             grid_clipboard: Rc::new(RefCell::new(GridClipboard::default())),
             design_clipboard: Rc::new(RefCell::new(Vec::new())),
             pending_toasts: Vec::new(),

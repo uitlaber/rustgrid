@@ -34,7 +34,7 @@ use crate::GroupEntry;
 /// The `format` marker written into a RustGrid `.rgc` bundle.
 pub const RUSTGRID_FORMAT: &str = "rustgrid-connections";
 /// The RustGrid bundle schema version.
-pub const RUSTGRID_VERSION: u32 = 1;
+pub const RUSTGRID_VERSION: u32 = 2;
 /// The default file name offered by the export dialog.
 pub const RUSTGRID_FILE_NAME: &str = "rustgrid-connections.rgc";
 
@@ -78,6 +78,16 @@ pub struct TransferConnection {
     /// The optional environment colour id (`red`/`yellow`/`green`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
+}
+
+impl TransferConnection {
+    /// Omit every credential when the export dialog's password option is unchecked.
+    pub fn clear_passwords(&mut self) {
+        self.password = None;
+        for layer in &mut self.settings.tunnel {
+            layer.password.clear();
+        }
+    }
 }
 
 /// How a RustGrid bundle protects the passwords it carries.
@@ -160,6 +170,7 @@ pub fn build_rustgrid_file(
 /// knows to decrypt them; a bundle with no password is written as-is.
 pub fn serialize_rustgrid(file: &ConnectionsFile) -> Result<String, TransferError> {
     let mut file = file.clone();
+    file.version = RUSTGRID_VERSION;
     let mut encrypted = false;
     for connection in &mut file.connections {
         if let Some(password) = connection.password.take()
@@ -167,6 +178,12 @@ pub fn serialize_rustgrid(file: &ConnectionsFile) -> Result<String, TransferErro
         {
             connection.password = Some(encrypt_password(&password)?);
             encrypted = true;
+        }
+        for layer in &mut connection.settings.tunnel {
+            if !layer.password.is_empty() {
+                layer.password = encrypt_password(&layer.password)?;
+                encrypted = true;
+            }
         }
     }
     if encrypted {
@@ -211,6 +228,19 @@ fn parse_rustgrid(content: &str) -> Result<ParsedConnections, TransferError> {
                 match decrypt_password(&token) {
                     Some(password) => connection.password = Some(password),
                     None => passwords_failed += 1,
+                }
+            }
+            // Version 1 protected only the database password: tunnel passwords in legacy
+            // bundles were plaintext even when the global protection flag said "builtin".
+            if file.version >= 2 {
+                for layer in &mut connection.settings.tunnel {
+                    if !layer.password.is_empty() {
+                        let token = std::mem::take(&mut layer.password);
+                        match decrypt_password(&token) {
+                            Some(password) => layer.password = password,
+                            None => passwords_failed += 1,
+                        }
+                    }
                 }
             }
         }
@@ -850,6 +880,112 @@ mod tests {
     use super::*;
     use crate::ConnectionGroup;
     use cbc::cipher::BlockEncryptMut;
+
+    fn connection_with_tunnel_passwords() -> TransferConnection {
+        serde_json::from_value(serde_json::json!({
+            "name": "Tunnel", "driver": "mongodb", "host": "127.0.0.1",
+            "port": 27017, "username": "db-user", "password": "db-password",
+            "settings": {"tunnel": [
+                {"kind": "ssh", "host": "bastion", "port": 22,
+                 "auth": "key_file", "key_path": "/keys/private",
+                 "password": "key passphrase"},
+                {"kind": "http", "host": "proxy", "port": 8080,
+                 "password": "proxy-password"}
+            ]}
+        }))
+        .expect("transfer fixture")
+    }
+
+    #[test]
+    fn rustgrid_encrypts_and_restores_every_tunnel_credential() {
+        let connection = connection_with_tunnel_passwords();
+        let file = build_rustgrid_file(vec![connection.clone()], Vec::new());
+        let json = serialize_rustgrid(&file).expect("export");
+        for password in ["key passphrase", "proxy-password", "db-password"] {
+            assert!(!json.contains(password));
+        }
+        let parsed = parse(&json, SourceFormat::RustGrid).expect("import");
+        assert_eq!(parsed.connections, vec![connection]);
+        assert_eq!(parsed.passwords_failed, 0);
+    }
+
+    #[test]
+    fn password_free_export_removes_database_and_tunnel_credentials() {
+        let mut connection = connection_with_tunnel_passwords();
+        connection.clear_passwords();
+        let json =
+            serialize_rustgrid(&build_rustgrid_file(vec![connection], Vec::new())).expect("export");
+        for password in ["key passphrase", "proxy-password", "db-password"] {
+            assert!(!json.contains(password));
+        }
+        let exported: serde_json::Value = serde_json::from_str(&json).expect("export JSON");
+        let exported_connection = &exported["connections"][0];
+        assert!(exported_connection.get("password").is_none());
+        for layer in exported_connection["settings"]["tunnel"]
+            .as_array()
+            .expect("tunnel layers")
+        {
+            assert!(layer.get("password").is_none());
+        }
+        let parsed = parse(&json, SourceFormat::RustGrid).expect("import");
+        assert_eq!(parsed.connections[0].password, None);
+        assert!(
+            parsed.connections[0]
+                .settings
+                .tunnel
+                .iter()
+                .all(|layer| layer.password.is_empty())
+        );
+        assert_eq!(
+            parsed.connections[0].settings.tunnel[0].key_path,
+            "/keys/private"
+        );
+        assert_eq!(parsed.passwords_failed, 0);
+    }
+
+    #[test]
+    fn legacy_protected_bundle_keeps_its_plaintext_tunnel_passwords() {
+        let expected = connection_with_tunnel_passwords();
+        let mut file = build_rustgrid_file(vec![expected.clone()], Vec::new());
+        file.version = 1;
+        file.password_protection = PasswordProtection::Builtin;
+        file.connections[0].password =
+            Some(encrypt_password("db-password").expect("protect DB password"));
+        let json = serde_json::to_string(&file).expect("legacy bundle");
+        let parsed = parse(&json, SourceFormat::RustGrid).expect("import legacy bundle");
+        assert_eq!(parsed.connections, vec![expected]);
+        assert_eq!(parsed.passwords_failed, 0);
+    }
+
+    #[test]
+    fn tunnel_credentials_are_protected_without_a_database_password() {
+        let mut connection = connection_with_tunnel_passwords();
+        connection.password = None;
+        let json = serialize_rustgrid(&build_rustgrid_file(vec![connection.clone()], Vec::new()))
+            .expect("export");
+        assert!(json.contains("\"password_protection\": \"builtin\""));
+        let parsed = parse(&json, SourceFormat::RustGrid).expect("import");
+        assert_eq!(parsed.connections, vec![connection]);
+    }
+
+    #[test]
+    fn invalid_protected_tunnel_password_is_reported_and_cleared() {
+        let file = build_rustgrid_file(vec![connection_with_tunnel_passwords()], Vec::new());
+        let json = serialize_rustgrid(&file).expect("export");
+        let mut broken: serde_json::Value = serde_json::from_str(&json).expect("bundle JSON");
+        broken["connections"][0]["settings"]["tunnel"][0]["password"] = "invalid-token".into();
+        let parsed = parse(&broken.to_string(), SourceFormat::RustGrid).expect("import");
+        assert_eq!(parsed.passwords_failed, 1);
+        assert!(parsed.connections[0].settings.tunnel[0].password.is_empty());
+        assert_eq!(
+            parsed.connections[0].settings.tunnel[1].password,
+            "proxy-password"
+        );
+        assert_eq!(
+            parsed.connections[0].password.as_deref(),
+            Some("db-password")
+        );
+    }
 
     /// Encrypt like Navicat: AES-128-CBC + PKCS7, hex-encoded (upper-case).
     fn encrypt_navicat(password: &str) -> String {

@@ -2,6 +2,12 @@ English | [简体中文](README_zh.md)
 
 # RustGrid
 
+This fork adds support for passphrase-protected SSH keys and reports tunnel connection errors
+before starting the database handshake. SSH server keys must match `~/.ssh/known_hosts`.
+SSH passwords and key passphrases are stored in the
+encrypted secret store. See the [SSH setup guide](docs/ssh-key-passphrase.md).
+Updates for this fork are checked in `uitlaber/rustgrid`.
+
 > A Navicat-style SQL, Redis and MongoDB GUI built in Rust — native, lightweight, zero learning curve.
 
 RustGrid is a cross-platform (Windows / macOS / Linux) database management tool for SQL, Redis and

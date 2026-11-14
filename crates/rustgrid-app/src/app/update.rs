@@ -18,7 +18,7 @@ use std::io::Read as _;
 use std::time::Duration;
 
 /// The GitHub repository whose Releases are checked.
-const REPO_OWNER: &str = "yisier";
+const REPO_OWNER: &str = "uitlaber";
 const REPO_NAME: &str = "rustgrid";
 
 /// The executable's base name. `self_update` appends the platform suffix (`.exe` on Windows) and

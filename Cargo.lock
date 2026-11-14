@@ -7798,6 +7798,7 @@ dependencies = [
  "russh",
  "rustgrid-core",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

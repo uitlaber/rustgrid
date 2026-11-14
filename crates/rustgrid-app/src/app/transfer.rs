@@ -356,7 +356,7 @@ impl AppView {
             let Some(node) = self.connections.get(*index) else {
                 continue;
             };
-            connections.push(TransferConnection {
+            let mut connection = TransferConnection {
                 id: Some(node.profile.id.clone()),
                 name: node.profile.name.clone(),
                 driver: node.profile.driver.as_str().to_string(),
@@ -372,7 +372,11 @@ impl AppView {
                     None
                 },
                 color: self.connection_colors.get(&node.profile.id).cloned(),
-            });
+            };
+            if !include_passwords {
+                connection.clear_passwords();
+            }
+            connections.push(connection);
         }
         let groups = export_groups(&self.tree_layout, &selected_ids);
         let count = connections.len();

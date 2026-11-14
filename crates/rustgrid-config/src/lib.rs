@@ -9,8 +9,10 @@ use directories::ProjectDirs;
 use rustgrid_core::{ConnectionProfile, SavedBackup, SavedQuery, SavedTransfer};
 use serde::{Deserialize, Serialize};
 
-const CURRENT_VERSION: u32 = 2;
+const CURRENT_VERSION: u32 = 3;
 const PROFILES_FILE: &str = "connections.json";
+/// Tunnel credentials share the encrypted store, but never the database-password namespace.
+const TUNNEL_SECRET_PREFIX: &str = "tunnel:";
 const SETTINGS_VERSION: u32 = 18;
 const SETTINGS_FILE: &str = "settings.json";
 /// The settings version that introduced 保留对象搜索 as a deliberate choice. Files written before
@@ -703,26 +705,71 @@ impl ConfigStore {
         }
         let contents = fs::read_to_string(path)?;
         let file: ProfilesFile = serde_json::from_str(&contents)?;
-        Ok(migrate(file).profiles)
+        let mut profiles = migrate(file).profiles;
+        // Keep the profile list usable if the secret store is damaged. The caller also loads
+        // database passwords through `load_secrets`, which reports that error to the user.
+        if let Ok(secrets) = secrets::load(&self.root) {
+            for profile in &mut profiles {
+                for (index, layer) in profile.settings.tunnel.iter_mut().enumerate() {
+                    // A legacy profile can still carry a plaintext password. Preserve it until
+                    // the next explicit save moves it into the encrypted store.
+                    if layer.password.is_empty() {
+                        layer.password = secrets
+                            .get(&tunnel_secret_key(&profile.id, index))
+                            .cloned()
+                            .unwrap_or_default();
+                    }
+                }
+            }
+        }
+        Ok(profiles)
     }
 
     pub fn save_profiles(&self, profiles: &[ConnectionProfile]) -> ConfigResult<()> {
         fs::create_dir_all(&self.root)?;
-        let file = ProfilesFile {
+        // Read successfully before writing either file: a damaged store must not be replaced by
+        // an incomplete set of credentials. Database passwords belong to `save_secrets`.
+        let mut secrets = secrets::load(&self.root)?;
+        secrets.retain(|key, _| !key.starts_with(TUNNEL_SECRET_PREFIX));
+        let mut file = ProfilesFile {
             version: CURRENT_VERSION,
             profiles: profiles.to_vec(),
         };
+        for profile in &mut file.profiles {
+            for (index, layer) in profile.settings.tunnel.iter_mut().enumerate() {
+                let password = std::mem::take(&mut layer.password);
+                if !password.is_empty() {
+                    secrets.insert(tunnel_secret_key(&profile.id, index), password);
+                }
+            }
+        }
         let contents = serde_json::to_string_pretty(&file)?;
-        fs::write(self.profiles_path(), contents)?;
+        // Persist encrypted credentials first, so the profile never references an unsaved key.
+        secrets::save(&self.root, &secrets)?;
+        let temporary = self.root.join(format!("{PROFILES_FILE}.tmp"));
+        fs::write(&temporary, contents)?;
+        fs::rename(&temporary, self.profiles_path())?;
         Ok(())
     }
 
+    /// Load database passwords. Tunnel credentials are restored by `load_profiles`.
     pub fn load_secrets(&self) -> ConfigResult<BTreeMap<String, String>> {
-        secrets::load(&self.root)
+        let mut secrets = secrets::load(&self.root)?;
+        secrets.retain(|key, _| !key.starts_with(TUNNEL_SECRET_PREFIX));
+        Ok(secrets)
     }
 
+    /// Replace the saved database passwords without discarding the tunnel credentials.
     pub fn save_secrets(&self, secrets: &BTreeMap<String, String>) -> ConfigResult<()> {
-        secrets::save(&self.root, secrets)
+        let mut combined = secrets::load(&self.root)?;
+        combined.retain(|key, _| key.starts_with(TUNNEL_SECRET_PREFIX));
+        combined.extend(
+            secrets
+                .iter()
+                .filter(|(key, _)| !key.starts_with(TUNNEL_SECRET_PREFIX))
+                .map(|(key, password)| (key.clone(), password.clone())),
+        );
+        secrets::save(&self.root, &combined)
     }
 
     pub fn load_settings(&self) -> ConfigResult<AppSettings> {
@@ -921,9 +968,202 @@ fn migrate(mut file: ProfilesFile) -> ProfilesFile {
     file
 }
 
+fn tunnel_secret_key(profile_id: &str, index: usize) -> String {
+    format!("{TUNNEL_SECRET_PREFIX}{profile_id}:{index}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestStore(ConfigStore);
+
+    impl TestStore {
+        fn new() -> Self {
+            let suffix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "rustgrid-config-tunnels-{}-{suffix}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&root).expect("test config directory");
+            Self(ConfigStore { root })
+        }
+    }
+
+    impl Drop for TestStore {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0.root);
+        }
+    }
+
+    fn tunneled_profile() -> ConnectionProfile {
+        serde_json::from_value(serde_json::json!({
+            "id": "conn-ssh", "name": "MongoDB", "driver": "mongodb",
+            "host": "127.0.0.1", "port": 27017, "username": "db-user",
+            "settings": {"tunnel": [
+                {"kind": "ssh", "host": "bastion", "port": 22,
+                 "username": "ssh-user", "auth": "key_file", "key_path": "/keys/private",
+                 "password": " key passphrase with spaces "},
+                {"kind": "socks5", "host": "proxy", "port": 1080,
+                 "password": "proxy-password"}
+            ]}
+        }))
+        .expect("profile fixture")
+    }
+
+    #[test]
+    fn tunnel_credentials_are_encrypted_and_database_password_updates_preserve_them() {
+        let store = TestStore::new();
+        let profile = tunneled_profile();
+        store
+            .0
+            .save_secrets(&BTreeMap::from([("conn-ssh".into(), "db-password".into())]))
+            .expect("database password");
+        store.0.save_profiles(&[profile.clone()]).expect("profiles");
+        let profiles_json = fs::read_to_string(store.0.profiles_path()).expect("profile JSON");
+        let secrets_json =
+            fs::read_to_string(store.0.root.join("secrets.json")).expect("secret JSON");
+        for password in [
+            "key passphrase with spaces",
+            "proxy-password",
+            "db-password",
+        ] {
+            assert!(!profiles_json.contains(password));
+            assert!(!secrets_json.contains(password));
+        }
+        let saved: serde_json::Value = serde_json::from_str(&profiles_json).expect("profile JSON");
+        let saved_profile = &saved["profiles"][0];
+        assert!(saved_profile.get("password").is_none());
+        for layer in saved_profile["settings"]["tunnel"]
+            .as_array()
+            .expect("tunnel layers")
+        {
+            assert!(layer.get("password").is_none());
+        }
+        assert_eq!(
+            store.0.load_profiles().expect("reload")[0].settings,
+            profile.settings
+        );
+        assert_eq!(
+            store.0.load_secrets().expect("DB passwords"),
+            BTreeMap::from([("conn-ssh".into(), "db-password".into())])
+        );
+
+        store
+            .0
+            .save_secrets(&BTreeMap::new())
+            .expect("forget DB password");
+        assert!(store.0.load_secrets().expect("DB passwords").is_empty());
+        assert_eq!(
+            store.0.load_profiles().expect("reload")[0].settings,
+            profile.settings
+        );
+    }
+
+    #[test]
+    fn legacy_plaintext_tunnel_credentials_migrate_on_save_without_a_plaintext_backup() {
+        let store = TestStore::new();
+        let profile = tunneled_profile();
+        let legacy = ProfilesFile {
+            version: 2,
+            profiles: vec![profile.clone()],
+        };
+        let legacy_json = serde_json::to_string(&legacy).expect("legacy JSON");
+        fs::write(store.0.profiles_path(), &legacy_json).expect("legacy config");
+        let profiles = store.0.load_profiles().expect("load legacy profiles");
+        assert_eq!(profiles[0].settings, profile.settings);
+        assert_eq!(
+            fs::read_to_string(store.0.profiles_path()).expect("unchanged legacy file"),
+            legacy_json
+        );
+        store.0.save_profiles(&profiles).expect("migrate on save");
+        let saved = fs::read_to_string(store.0.profiles_path()).expect("saved JSON");
+        assert!(!saved.contains("key passphrase with spaces"));
+        assert!(!saved.contains("proxy-password"));
+        let file: ProfilesFile = serde_json::from_str(&saved).expect("saved profile");
+        assert_eq!(file.version, CURRENT_VERSION);
+        assert_eq!(
+            store.0.load_profiles().expect("reload")[0].settings,
+            profile.settings
+        );
+        assert!(!store.0.root.join("connections.json.bak").exists());
+    }
+
+    #[test]
+    fn removing_a_tunnel_or_profile_removes_its_saved_credentials() {
+        let store = TestStore::new();
+        let mut profile = tunneled_profile();
+        store.0.save_profiles(&[profile.clone()]).expect("save");
+        profile.settings.tunnel.remove(1);
+        profile.settings.tunnel[0].password.clear();
+        store
+            .0
+            .save_profiles(&[profile])
+            .expect("clear credentials");
+        assert!(
+            secrets::load(&store.0.root)
+                .expect("raw secret map")
+                .is_empty()
+        );
+        store
+            .0
+            .save_profiles(&[tunneled_profile()])
+            .expect("restore");
+        store.0.save_profiles(&[]).expect("delete profile");
+        assert!(
+            secrets::load(&store.0.root)
+                .expect("raw secret map")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn missing_secret_key_keeps_profiles_available_and_blocks_destructive_saves() {
+        let store = TestStore::new();
+        store.0.save_profiles(&[tunneled_profile()]).expect("save");
+        let profiles_before = fs::read(store.0.profiles_path()).expect("profile bytes");
+        let secrets_path = store.0.root.join("secrets.json");
+        let secrets_before = fs::read(&secrets_path).expect("secret bytes");
+        fs::remove_file(store.0.root.join("secret.key")).expect("remove key");
+        let profiles = store
+            .0
+            .load_profiles()
+            .expect("profiles survive missing key");
+        assert_eq!(profiles.len(), 1);
+        assert!(profiles[0].settings.tunnel[0].password.is_empty());
+        assert!(store.0.load_secrets().is_err());
+        assert!(store.0.save_profiles(&profiles).is_err());
+        assert!(store.0.save_secrets(&BTreeMap::new()).is_err());
+        assert_eq!(fs::read(store.0.profiles_path()).unwrap(), profiles_before);
+        assert_eq!(fs::read(secrets_path).unwrap(), secrets_before);
+        assert!(!store.0.root.join("secret.key").exists());
+    }
+
+    #[test]
+    fn invalid_ciphertext_is_reported_instead_of_silently_discarding_credentials() {
+        let store = TestStore::new();
+        store.0.save_profiles(&[tunneled_profile()]).expect("save");
+        let path = store.0.root.join("secrets.json");
+        let mut file: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        file["secrets"][tunnel_secret_key("conn-ssh", 0)] = "invalid-ciphertext".into();
+        let damaged = serde_json::to_vec(&file).unwrap();
+        fs::write(&path, &damaged).unwrap();
+        assert!(store.0.load_secrets().is_err());
+        assert_eq!(
+            store
+                .0
+                .load_profiles()
+                .expect("profile list remains available")
+                .len(),
+            1
+        );
+        assert!(store.0.save_profiles(&[tunneled_profile()]).is_err());
+        assert_eq!(fs::read(&path).unwrap(), damaged);
+    }
 
     fn keys(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()

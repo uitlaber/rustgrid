@@ -82,7 +82,9 @@ pub struct TunnelLayer {
     pub port: u16,
     #[serde(default)]
     pub username: String,
-    #[serde(default)]
+    /// The SSH/proxy password, or the private-key passphrase for [`TunnelAuth::KeyFile`].
+    /// ConfigStore removes this value from persisted profiles and stores it encrypted.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub password: String,
     /// Private key path for an SSH layer using [`TunnelAuth::KeyFile`].
     #[serde(default)]

@@ -8,6 +8,7 @@
 //! The SSH layer is a real SSH client (password or private-key authentication) using
 //! `direct-tcpip`; the proxy/HTTP layers speak an HTTP `CONNECT` handshake.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,12 +17,23 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use rustgrid_core::{TunnelAuth, TunnelKind, TunnelLayer};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
+
+/// Bound DNS, connection, authentication and forwarding setup, including stalled proxy replies.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A boxed, bidirectional byte stream (a TCP socket, an SSH channel, or a proxied socket).
 trait ByteStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> ByteStream for T {}
 type Stream = Box<dyn ByteStream>;
+
+/// Load and unlock a key once, outside the async executor, rather than repeating bcrypt for every
+/// socket in a database connection pool. Never derive Debug for credentials or decrypted keys.
+struct PreparedLayer {
+    layer: TunnelLayer,
+    key: Option<Arc<russh::keys::PrivateKey>>,
+    known_hosts: Option<PathBuf>,
+}
 
 /// A running tunnel: a local listener plus the task that accepts and forwards connections. Dropping
 /// it stops the listener, so it must be kept alive for as long as the database connection is.
@@ -37,6 +49,26 @@ impl Tunnel {
         target_host: String,
         target_port: u16,
     ) -> Result<Self, String> {
+        Self::start_with_known_hosts(layers, target_host, target_port, None).await
+    }
+
+    // An explicit file is used by local tests; public callers always use ~/.ssh/known_hosts.
+    async fn start_with_known_hosts(
+        layers: Vec<TunnelLayer>,
+        target_host: String,
+        target_port: u16,
+        known_hosts: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        if layers.is_empty() {
+            return Err("the tunnel chain is empty".to_string());
+        }
+        let mut layers = tokio::task::spawn_blocking(move || prepare_layers(layers))
+            .await
+            .map_err(|error| format!("could not prepare the tunnel credentials: {error}"))??;
+        for prepared in &mut layers {
+            prepared.known_hosts = known_hosts.clone();
+        }
+        let layers = Arc::new(layers);
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
             .map_err(|error| format!("could not start the tunnel listener: {error}"))?;
@@ -45,17 +77,54 @@ impl Tunnel {
             .map_err(|error| format!("could not read the tunnel port: {error}"))?
             .port();
 
+        // Establish a real connection before returning the local endpoint. Otherwise a rejected
+        // SSH login or an unreadable key only closes the driver's socket and becomes a misleading
+        // MongoDB timeout. This stream is reused for the first client, not a throwaway probe.
+        let mut first_remote = Some(
+            open_stream_with_timeout(&layers, (&target_host, target_port), CONNECT_TIMEOUT).await?,
+        );
+
         let task = tokio::spawn(async move {
+            // Owning the children here also closes existing forwards when the tunnel is dropped.
+            let mut connections = JoinSet::new();
             loop {
-                let Ok((mut client, _peer)) = listener.accept().await else {
-                    break;
+                let accepted = tokio::select! {
+                    accepted = listener.accept() => accepted,
+                    _ = connections.join_next(), if !connections.is_empty() => continue,
                 };
-                let layers = layers.clone();
+                let (mut client, _peer) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        tracing::warn!(%error, "tunnel listener failed");
+                        break;
+                    }
+                };
+                let layers = Arc::clone(&layers);
                 let target_host = target_host.clone();
-                tokio::spawn(async move {
-                    if let Ok(mut remote) = open_stream(&layers, (&target_host, target_port)).await
-                    {
-                        let _ = tokio::io::copy_bidirectional(&mut client, &mut remote).await;
+                let prepared_remote = first_remote.take();
+                connections.spawn(async move {
+                    let remote = match prepared_remote {
+                        Some(remote) => Ok(remote),
+                        None => {
+                            open_stream_with_timeout(
+                                &layers,
+                                (&target_host, target_port),
+                                CONNECT_TIMEOUT,
+                            )
+                            .await
+                        }
+                    };
+                    match remote {
+                        Ok(mut remote) => {
+                            if let Err(error) =
+                                tokio::io::copy_bidirectional(&mut client, &mut remote).await
+                            {
+                                tracing::warn!(%error, "tunnel forwarding failed");
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "could not open a tunnel connection");
+                        }
                     }
                 });
             }
@@ -76,9 +145,72 @@ impl Drop for Tunnel {
     }
 }
 
+fn prepare_layers(layers: Vec<TunnelLayer>) -> Result<Vec<PreparedLayer>, String> {
+    layers
+        .into_iter()
+        .map(|mut layer| {
+            let key = if layer.kind == TunnelKind::Ssh && layer.auth == TunnelAuth::KeyFile {
+                let key = load_ssh_key(&layer)?;
+                // The decrypted key is sufficient for later connections; do not clone its
+                // passphrase into every worker together with the tunnel settings.
+                layer.password.clear();
+                Some(Arc::new(key))
+            } else {
+                None
+            };
+            Ok(PreparedLayer {
+                layer,
+                key,
+                known_hosts: None,
+            })
+        })
+        .collect()
+}
+
+fn load_ssh_key(layer: &TunnelLayer) -> Result<russh::keys::PrivateKey, String> {
+    let passphrase = (!layer.password.is_empty()).then_some(layer.password.as_str());
+    russh::keys::load_secret_key(layer.key_path.trim(), passphrase).map_err(|error| match error {
+        russh::keys::Error::KeyIsEncrypted => format!(
+            "SSH key {} is encrypted; enter its key passphrase in Tunnel/Proxy.",
+            layer.key_path
+        ),
+        russh::keys::Error::IO(_) => {
+            format!("could not read the SSH key {}: {error}", layer.key_path)
+        }
+        _ if passphrase.is_some() => format!(
+            "could not unlock the SSH key {}; check its passphrase and key file: {error}",
+            layer.key_path
+        ),
+        _ => format!(
+            "could not load the SSH key {}; if it is encrypted, enter its key passphrase in Tunnel/Proxy: {error}",
+            layer.key_path
+        ),
+    })
+}
+
+async fn open_stream_with_timeout(
+    layers: &[PreparedLayer],
+    target: (&str, u16),
+    timeout: Duration,
+) -> Result<Stream, String> {
+    tokio::time::timeout(timeout, open_stream(layers, target))
+        .await
+        .map_err(|_| {
+            format!(
+                "tunnel connection to {}:{} timed out after {} seconds; check the SSH/proxy server and forwarding destination",
+                target.0,
+                target.1,
+                timeout.as_secs()
+            )
+        })?
+}
+
 /// Dial the first layer, then hand the socket off through every layer until it reaches `target`.
-async fn open_stream(layers: &[TunnelLayer], target: (&str, u16)) -> Result<Stream, String> {
-    let first = &layers[0];
+async fn open_stream(layers: &[PreparedLayer], target: (&str, u16)) -> Result<Stream, String> {
+    let first = &layers
+        .first()
+        .ok_or_else(|| "the tunnel chain is empty".to_string())?
+        .layer;
     let tcp = TcpStream::connect((first.host.as_str(), first.port))
         .await
         .map_err(|error| {
@@ -90,13 +222,14 @@ async fn open_stream(layers: &[TunnelLayer], target: (&str, u16)) -> Result<Stre
     let _ = tcp.set_nodelay(true);
 
     let mut stream: Stream = Box::new(tcp);
-    for (index, layer) in layers.iter().enumerate() {
+    for (index, prepared) in layers.iter().enumerate() {
+        let layer = &prepared.layer;
         let next = layers
             .get(index + 1)
-            .map(|next| (next.host.as_str(), next.port))
+            .map(|next| (next.layer.host.as_str(), next.layer.port))
             .unwrap_or(target);
         stream = match layer.kind {
-            TunnelKind::Ssh => ssh_handshake(stream, layer, next).await?,
+            TunnelKind::Ssh => ssh_handshake(stream, prepared, next).await?,
             TunnelKind::Socks5 => socks5_connect(stream, layer, next).await?,
             TunnelKind::Http => http_connect(stream, layer, next).await?,
         };
@@ -104,18 +237,77 @@ async fn open_stream(layers: &[TunnelLayer], target: (&str, u16)) -> Result<Stre
     Ok(stream)
 }
 
-/// The russh client handler. It accepts any host key; the connection is still encrypted, but the
-/// server identity is not pinned.
-struct Client;
+/// Verify each SSH hop against the user's known_hosts before sending authentication information.
+/// Unknown or changed keys are never trusted automatically.
+struct Client {
+    host: String,
+    port: u16,
+    known_hosts: Option<PathBuf>,
+}
 
 impl russh::client::Handler for Client {
-    type Error = russh::Error;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::PublicKeyOrCertificate,
+        server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        Ok(true)
+        use russh::keys::ssh_key::known_hosts::{KnownHosts, Marker};
+
+        let key = match server_public_key {
+            russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } => key,
+            russh::keys::PublicKeyOrCertificate::Certificate(_) => {
+                return Err("SSH host certificates are not supported; use a host public key recorded in ~/.ssh/known_hosts.".into());
+            }
+        };
+        let path = self
+            .known_hosts
+            .clone()
+            .or_else(|| std::env::home_dir().map(|home| home.join(".ssh").join("known_hosts")))
+            .ok_or("could not locate ~/.ssh/known_hosts")?;
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => {
+                return Err(format!("could not read {}: {error}", path.display()).into());
+            }
+        };
+        // russh's matcher ignores marker lines. Honor revoked keys first, using ssh-key's parser.
+        // Conservatively reject the same revoked key regardless of its recorded host patterns.
+        for entry in KnownHosts::new(&contents) {
+            let entry =
+                entry.map_err(|error| format!("could not parse {}: {error}", path.display()))?;
+            if entry.marker() == Some(&Marker::Revoked)
+                && entry.public_key().key_data() == key.key_data()
+            {
+                return Err(format!(
+                    "SSH host key for {}:{} is revoked in known_hosts. Connection refused.",
+                    self.host, self.port
+                )
+                .into());
+            }
+        }
+        let result = russh::keys::check_known_hosts_path(&self.host, self.port, key, &path);
+        match result {
+            Ok(true) => Ok(true),
+            Ok(false) => Err(format!(
+                "SSH host key for {}:{} is unknown ({}). Verify its fingerprint with your server administrator, then connect once using system ssh to record it in ~/.ssh/known_hosts.",
+                self.host,
+                self.port,
+                key.fingerprint(russh::keys::HashAlg::Sha256)
+            )
+            .into()),
+            Err(russh::keys::Error::KeyChanged { line }) => Err(format!(
+                "SSH host key for {}:{} has changed (known_hosts line {line}). Connection refused; verify the server fingerprint with your administrator before updating ~/.ssh/known_hosts.",
+                self.host, self.port
+            )
+            .into()),
+            Err(error) => Err(format!(
+                "could not verify the SSH host key for {}:{} against known_hosts: {error}",
+                self.host, self.port
+            )
+            .into()),
+        }
     }
 }
 
@@ -163,20 +355,28 @@ impl AsyncWrite for SshStream {
 /// Authenticate an SSH session over `stream` and open a `direct-tcpip` channel to `target`.
 async fn ssh_handshake(
     stream: Stream,
-    layer: &TunnelLayer,
+    prepared: &PreparedLayer,
     target: (&str, u16),
 ) -> Result<Stream, String> {
+    let layer = &prepared.layer;
     let config = Arc::new(russh::client::Config {
         inactivity_timeout: Some(Duration::from_secs(30)),
         ..Default::default()
     });
-    let mut session = russh::client::connect_stream(config, stream, Client)
+    let handler = Client {
+        host: layer.host.clone(),
+        port: layer.port,
+        known_hosts: prepared.known_hosts.clone(),
+    };
+    let mut session = russh::client::connect_stream(config, stream, handler)
         .await
         .map_err(|error| format!("SSH handshake failed: {error}"))?;
 
     let auth = if layer.auth == TunnelAuth::KeyFile {
-        let key = russh::keys::load_secret_key(layer.key_path.trim(), None)
-            .map_err(|error| format!("could not read the SSH key {}: {error}", layer.key_path))?;
+        let key = prepared
+            .key
+            .as_ref()
+            .ok_or_else(|| "SSH private key was not loaded".to_string())?;
         let hash = session
             .best_supported_rsa_hash()
             .await
@@ -185,7 +385,7 @@ async fn ssh_handshake(
         session
             .authenticate_publickey(
                 layer.username.clone(),
-                russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), hash),
+                russh::keys::PrivateKeyWithHashAlg::new(Arc::clone(key), hash),
             )
             .await
     } else {
@@ -373,3 +573,6 @@ async fn socks5_connect(
 
     Ok(stream)
 }
+
+#[cfg(test)]
+mod tests;
