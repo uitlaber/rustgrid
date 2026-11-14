@@ -7794,11 +7794,16 @@ dependencies = [
 name = "rustgrid-tunnel"
 version = "0.1.14"
 dependencies = [
+ "aes 0.8.4",
  "base64 0.22.1",
+ "cbc 0.1.2",
+ "hex",
+ "md5 0.8.1",
  "russh",
  "rustgrid-core",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

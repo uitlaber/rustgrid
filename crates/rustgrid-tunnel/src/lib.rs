@@ -18,6 +18,9 @@ use rustgrid_core::{TunnelAuth, TunnelKind, TunnelLayer};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinHandle, JoinSet};
+use zeroize::Zeroizing;
+
+mod legacy_pem;
 
 /// Bound DNS, connection, authentication and forwarding setup, including stalled proxy replies.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -169,7 +172,14 @@ fn prepare_layers(layers: Vec<TunnelLayer>) -> Result<Vec<PreparedLayer>, String
 
 fn load_ssh_key(layer: &TunnelLayer) -> Result<russh::keys::PrivateKey, String> {
     let passphrase = (!layer.password.is_empty()).then_some(layer.password.as_str());
-    russh::keys::load_secret_key(layer.key_path.trim(), passphrase).map_err(|error| match error {
+    let result = (|| {
+        let contents = Zeroizing::new(std::fs::read_to_string(layer.key_path.trim())?);
+        if let Some(key) = legacy_pem::decode_aes256_rsa(&contents, passphrase)? {
+            return Ok(key);
+        }
+        russh::keys::decode_secret_key(&contents, passphrase)
+    })();
+    result.map_err(|error| match error {
         russh::keys::Error::KeyIsEncrypted => format!(
             "SSH key {} is encrypted; enter its key passphrase in Tunnel/Proxy.",
             layer.key_path

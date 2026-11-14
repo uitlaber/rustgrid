@@ -24,7 +24,7 @@ packages = json.load(sys.stdin)["packages"]
 print(next(p["version"] for p in packages if p["name"] == "rustgrid-app"))
 ')"
 build_root="${CARGO_TARGET_DIR:-$repo_root/target}"
-app="$build_root/local/RustGrid SSH.app"
+app="${RUSTGRID_BUNDLE_DIR:-$build_root/local/RustGrid SSH.app}"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$build_root/$profile/RustGrid" "$app/Contents/MacOS/RustGrid"
 sed "s/@VERSION@/$version/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
